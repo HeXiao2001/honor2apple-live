@@ -9,10 +9,10 @@
 需要 macOS、Python 3.9+、Xcode Command Line Tools（提供 `swift`）。
 
 ```sh
-python3 -m pip install .
+python3 -m pip install 'git+https://github.com/HeXiao2001/honor2apple-live.git'
 ```
 
-请在本项目目录运行这条命令。首次安装需要联网下载 Python 依赖。
+首次安装需要联网下载 Python 依赖。若已下载本项目，也可在项目目录运行 `python3 -m pip install .`。
 
 ## 一行命令
 
