@@ -12,7 +12,7 @@ import sys
 import tempfile
 import uuid
 
-from .media import UnsupportedMedia, convert_honor_jpeg
+from .media import UnsupportedMedia, convert_honor_jpeg, convert_motion_sdr
 from .dng_gps import copy_gps_from_jpeg
 
 
@@ -25,7 +25,9 @@ def digest(path: Path) -> str:
 
 
 def convert_one(source: Path, output: Path, movie: Path | None,
-                gps_jpeg: Path | None, overwrite: bool) -> list[Path]:
+                gps_jpeg: Path | None, overwrite: bool,
+                sdr_fallback: bool = False,
+                hdr_profile: str = "legacy") -> list[Path]:
     if not source.is_file():
         raise FileNotFoundError(source)
     if source.suffix.lower() not in (".jpg", ".jpeg", ".dng"):
@@ -58,13 +60,22 @@ def convert_one(source: Path, output: Path, movie: Path | None,
         return [target]
 
     identifier = str(uuid.uuid4()).upper()
-    hdr, movie_bytes = convert_honor_jpeg(source.read_bytes(), identifier,
-                                          movie.read_bytes() if movie else None)
+    source_bytes = source.read_bytes()
+    movie_bytes_external = movie.read_bytes() if movie else None
+    try:
+        still, movie_bytes = convert_honor_jpeg(source_bytes, identifier,
+                                                 movie_bytes_external,
+                                                 hdr_profile)
+    except UnsupportedMedia:
+        if not sdr_fallback:
+            raise
+        still, movie_bytes = convert_motion_sdr(source_bytes, identifier,
+                                                 movie_bytes_external)
     still_target = output / (stem + ".jpg")
     movie_target = output / (stem + ".mov") if movie_bytes is not None else None
     targets = [still_target] + ([movie_target] if movie_target else [])
     if still_target.resolve() == source.resolve():
-        raise UnsupportedMedia("HDR output would overwrite the original JPG; choose another output directory")
+        raise UnsupportedMedia("Output would overwrite the original JPG; choose another output directory")
     if movie is not None and movie_target is not None and movie_target.resolve() == movie.resolve():
         raise UnsupportedMedia("MOV output would overwrite the source video; choose another output directory")
     if not overwrite:
@@ -75,7 +86,7 @@ def convert_one(source: Path, output: Path, movie: Path | None,
     with tempfile.TemporaryDirectory(prefix="honor2apple-") as temporary:
         scratch = Path(temporary)
         still_temp = scratch / still_target.name
-        still_temp.write_bytes(hdr)
+        still_temp.write_bytes(still)
         if movie_target is not None:
             source_video = scratch / "source.mp4"
             source_video.write_bytes(movie_bytes)
@@ -107,6 +118,10 @@ def main(argv: list[str] | None = None) -> int:
     gps_options.add_argument("--auto-gps", action="store_true",
                              help="For each DNG, require a same-named JPG alongside it for GPS")
     parser.add_argument("--overwrite", action="store_true", help="Replace existing output files")
+    parser.add_argument("--sdr-fallback", action="store_true",
+                        help="Preserve motion as an SDR Live Photo when HDR is not calibrated")
+    parser.add_argument("--hdr-profile", choices=("auto", "legacy", "full_1p5"),
+                        default="auto", help="Measured HDR mapping; auto selects by the private map range")
     args = parser.parse_args(argv)
     if args.video and (len(args.files) != 1 or args.files[0].suffix.lower() not in (".jpg", ".jpeg")):
         parser.error("--video requires exactly one JPEG input")
@@ -124,7 +139,8 @@ def main(argv: list[str] | None = None) -> int:
                         else None)
             if gps_jpeg and not gps_jpeg.is_file():
                 raise FileNotFoundError(f"GPS companion JPEG is missing: {gps_jpeg}")
-            results = convert_one(source, args.output, args.video, gps_jpeg, args.overwrite)
+            results = convert_one(source, args.output, args.video, gps_jpeg,
+                                  args.overwrite, args.sdr_fallback, args.hdr_profile)
             print(f"{source.name} -> " + ", ".join(str(path) for path in results))
         except (OSError, ValueError, RuntimeError) as error:
             print(f"{source}: {error}", file=sys.stderr)

@@ -18,8 +18,20 @@ class UnsupportedMedia(ValueError):
     """The input falls outside the measured, verified profile."""
 
 
-def profile() -> dict:
-    return json.loads(Path(__file__).with_name("calibration.json").read_text())
+def profile(name: str = "legacy") -> dict:
+    files = {"legacy": "calibration.json", "full_1p5": "calibration_full_1p5.json"}
+    if name not in files:
+        raise ValueError(f"Unknown HDR calibration profile: {name}")
+    return json.loads(Path(__file__).with_name(files[name]).read_text())
+
+
+def select_calibration(private_gain: np.ndarray, requested: str) -> str:
+    """Select a measured target rendition without extrapolating gain values."""
+    if requested != "auto":
+        return requested
+    # The legacy 3.846x table was validated through level 134. The new
+    # two-photo table validates the complete 0..255 range at 1.5x.
+    return "legacy" if int(private_gain.max()) <= 134 else "full_1p5"
 
 
 def header_segments(data: bytes):
@@ -165,11 +177,27 @@ def _apple_note(identifier: str) -> bytes:
     return bytes(note) + encoded
 
 
-def _add_live_identifier(data: bytes, identifier: str) -> bytes:
+def _add_live_identifier(data: bytes, identifier: str, *, hdr: bool = True) -> bytes:
     exif = [(pos, payload) for pos, marker, payload in header_segments(data)
             if marker == 0xe1 and payload.startswith(b"Exif\0\0")]
-    if len(exif) != 1:
-        raise UnsupportedMedia("Expected one EXIF segment in still image")
+    if len(exif) > 1:
+        raise UnsupportedMedia("Multiple EXIF segments in still image")
+    note = _apple_note(identifier)
+    if not exif:
+        # Some shared motion photos have no EXIF at all. Add only the Apple
+        # pairing tag; the compressed image and any XMP remain untouched.
+        tiff = bytearray(b"MM\0*\0\0\0\x08")
+        tiff += struct.pack(">H", 1)
+        tiff += struct.pack(">HHII", 0x8769, 4, 1, 26)
+        tiff += b"\0\0\0\0"
+        tiff += struct.pack(">H", 1)
+        tiff += struct.pack(">HHII", 0x927c, 7, len(note), 44)
+        tiff += b"\0\0\0\0" + note
+        edited = _with_payload(0xe1, b"Exif\0\0" + tiff) + data[2:]
+        output = data[:2] + edited
+        if image_scan(data) != image_scan(output):
+            raise UnsupportedMedia("Primary compressed image changed")
+        return output
     segment_pos, payload = exif[0]
     tiff = 6
     order = payload[tiff:tiff + 2]
@@ -188,38 +216,76 @@ def _add_live_identifier(data: bytes, identifier: str) -> bytes:
                 if u16(offset + 2 + index * 12) == tag]
 
     exif_pointer = entries(u32(tiff + 4), 0x8769)
-    if len(exif_pointer) != 1:
-        raise UnsupportedMedia("Missing EXIF IFD")
-    maker_entries = entries(u32(exif_pointer[0] + 8), 0x927c)
-    if not maker_entries:
-        raise UnsupportedMedia("Missing MakerNote slot; unsupported EXIF layout")
-    note = _apple_note(identifier)
+    if len(exif_pointer) > 1:
+        raise UnsupportedMedia("Multiple EXIF IFD pointers")
     edited_payload = bytearray(payload + note)
-    for entry in maker_entries:
-        struct.pack_into(endian + "I", edited_payload, entry + 4, len(note))
-        struct.pack_into(endian + "I", edited_payload, entry + 8, len(payload) - tiff)
+    if exif_pointer:
+        exif_ifd = u32(exif_pointer[0] + 8)
+        maker_entries = entries(exif_ifd, 0x927c)
+        if maker_entries:
+            for entry in maker_entries:
+                struct.pack_into(endian + "I", edited_payload, entry + 4, len(note))
+                struct.pack_into(endian + "I", edited_payload, entry + 8, len(payload) - tiff)
+        else:
+            old_ifd_at = tiff + exif_ifd
+            old_count = u16(old_ifd_at)
+            old_entries = payload[old_ifd_at + 2:old_ifd_at + 2 + 12 * old_count]
+            next_ifd = payload[old_ifd_at + 2 + 12 * old_count:old_ifd_at + 6 + 12 * old_count]
+            new_ifd = len(edited_payload) - tiff
+            edited_payload += struct.pack(endian + "H", old_count + 1)
+            edited_payload += old_entries
+            edited_payload += struct.pack(endian + "HHII", 0x927c, 7, len(note), len(payload) - tiff)
+            edited_payload += next_ifd
+            struct.pack_into(endian + "I", edited_payload, exif_pointer[0] + 8, new_ifd)
+    else:
+        # Keep every original IFD0 entry and all referenced metadata in place.
+        old_ifd_at = tiff + u32(tiff + 4)
+        old_count = u16(old_ifd_at)
+        old_entries = payload[old_ifd_at + 2:old_ifd_at + 2 + 12 * old_count]
+        next_ifd = payload[old_ifd_at + 2 + 12 * old_count:old_ifd_at + 6 + 12 * old_count]
+        new_exif_ifd = len(edited_payload) - tiff
+        edited_payload += struct.pack(endian + "H", 1)
+        edited_payload += struct.pack(endian + "HHII", 0x927c, 7, len(note), len(payload) - tiff)
+        edited_payload += b"\0\0\0\0"
+        new_ifd0 = len(edited_payload) - tiff
+        edited_payload += struct.pack(endian + "H", old_count + 1)
+        edited_payload += old_entries
+        edited_payload += struct.pack(endian + "HHII", 0x8769, 4, 1, new_exif_ifd)
+        edited_payload += next_ifd
+        struct.pack_into(endian + "I", edited_payload, tiff + 4, new_ifd0)
     replacement = _with_payload(0xe1, bytes(edited_payload))
     old_length = int.from_bytes(data[segment_pos + 2:segment_pos + 4], "big")
     edited = bytearray(data[:segment_pos] + replacement + data[segment_pos + 2 + old_length:])
-    mpf = edited.find(b"MPF\0")
-    gain_at = edited.rfind(b"\xff\xd8\xff")
-    if mpf < 0 or gain_at <= mpf:
-        raise UnsupportedMedia("Cannot update MPF after Live Photo identifier")
-    struct.pack_into(">I", edited, mpf + 58, gain_at)
-    struct.pack_into(">I", edited, mpf + 74, len(edited) - gain_at)
-    struct.pack_into(">I", edited, mpf + 78, gain_at - mpf - 4)
+    if hdr:
+        mpf = edited.find(b"MPF\0")
+        gain_at = edited.rfind(b"\xff\xd8\xff")
+        if mpf < 0 or gain_at <= mpf:
+            raise UnsupportedMedia("Cannot update MPF after Live Photo identifier")
+        struct.pack_into(">I", edited, mpf + 58, gain_at)
+        struct.pack_into(">I", edited, mpf + 74, len(edited) - gain_at)
+        struct.pack_into(">I", edited, mpf + 78, gain_at - mpf - 4)
     output = bytes(edited)
     if image_scan(data) != image_scan(output):
         raise UnsupportedMedia("Primary compressed image changed")
-    if image_scan(data[gain_at - (len(replacement) - (old_length + 2)):]) != image_scan(output[gain_at:]):
+    if hdr and image_scan(data[gain_at - (len(replacement) - (old_length + 2)):]) != image_scan(output[gain_at:]):
         raise UnsupportedMedia("Gain-map compressed image changed")
     return output
 
 
+def convert_motion_sdr(source: bytes, identifier: str,
+                       external_movie: bytes | None = None) -> tuple[bytes, bytes]:
+    """Preserve the primary JPEG scan and movie when HDR calibration is unavailable."""
+    base = source[:primary_end(source)]
+    movie = external_movie if external_movie is not None else _find_embedded_video(source, len(base))
+    if movie is None:
+        raise UnsupportedMedia("No valid embedded movie found")
+    return _add_live_identifier(base, identifier, hdr=False), movie
+
+
 def convert_honor_jpeg(source: bytes, identifier: str | None = None,
-                       external_movie: bytes | None = None) -> tuple[bytes, bytes | None]:
+                       external_movie: bytes | None = None,
+                       calibration_profile: str = "legacy") -> tuple[bytes, bytes | None]:
     """Return an ISO gain-map JPEG and optional unmodified MP4 bitstream."""
-    config = profile()
     base = source[:primary_end(source)]
     with Image.open(BytesIO(base)) as image:
         size = image.size
@@ -227,6 +293,8 @@ def convert_honor_jpeg(source: bytes, identifier: str | None = None,
         if exif.get(271) != "HONOR" or exif.get(272) != "BVL-AN16":
             raise UnsupportedMedia("Only the calibrated HONOR BVL-AN16 profile is supported")
     gain = _find_private_gain(source, len(base), size)
+    calibration_profile = select_calibration(gain, calibration_profile)
+    config = profile(calibration_profile)
     hdr = _standard_hdr(base, gain, config)
     movie = external_movie if external_movie is not None else _find_embedded_video(source, len(base))
     if movie is not None:

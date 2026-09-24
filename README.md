@@ -1,8 +1,8 @@
 # honor2apple-live
 
-将已校准的荣耀 HDR 动态照片转换为可一同导入 macOS「照片」的 HDR JPG + Live Photo MOV；也可原样复制 DNG，或从**同一张照片**的手机分享版 JPG 复制真实 GPS 到一份新 DNG。
+将荣耀动态照片转换为可一同导入 macOS「照片」的 HDR JPG + Live Photo MOV；也可原样复制 DNG，或从**同一张照片**的手机分享版 JPG 复制真实 GPS 到一份新 DNG。
 
-目前仅支持实测的 **HONOR BVL-AN16** 文件及私有增益图范围。程序遇到未校准的增益值会报错，不会猜测 HDR。源文件始终保留。视频、音频样本直通封装到 MOV；主图压缩数据保持不变。生成标准 HDR 增益图时会重新编码增益图，因此不能把转换后的 JPG 称为整个文件无损。
+目前针对 **HONOR BVL-AN16** 提供两套实测映射：旧版 3.846 倍 HDR 映射覆盖私有值 0–134；新版 1.5 倍 HDR 映射覆盖 0–255，使用两张独立裁剪样本交叉验证。`auto`（默认）会按私有增益图的最大编码值选择已测映射，不会外推未知值。没有增益图的动态照片可用 `--sdr-fallback` 保留动态效果，但静态主图不声明 HDR。源文件始终保留。视频、音频样本直通封装到 MOV；主图压缩数据保持不变。生成标准 HDR 增益图时会重新编码增益图，因此不能把转换后的 JPG 称为整个文件无损。
 
 ## 安装
 
@@ -20,12 +20,14 @@ python3 -m pip install 'git+https://github.com/HeXiao2001/honor2apple-live.git'
 honor2apple "/path/to/IMG_20260920_210339.jpg" -o "/path/to/converted"
 ```
 
-输出同名 `.jpg` 和 `.mov`。在 Mac「照片」中**同时选择这两个文件导入**，它们会组成一张可播放的 HDR 实况照片。程序不自动操作你的照片图库。
+输出同名 `.jpg` 和 `.mov`。在 Mac「照片」中**同时选择这两个文件导入**，它们会组成一张可播放的 HDR 实况照片。程序不自动操作你的照片图库。对没有完成 HDR 校准的动态照片，可加 `--sdr-fallback`；这会保留真实视频，不估算 HDR。
 
 批量转换：
 
 ```sh
-honor2apple /path/to/Downloads/IMG_*.jpg -o /path/to/converted
+honor2apple /path/to/Downloads/IMG_*.jpg -o /path/to/converted --sdr-fallback
+
+如需固定使用某个已测目标映射，可使用 `--hdr-profile legacy` 或 `--hdr-profile full_1p5`；通常保留默认的 `auto` 即可。
 ```
 
 如果视频是单独文件，可为单张 JPG 指定 `--video /path/to/source.mp4`。
